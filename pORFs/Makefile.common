@@ -1,0 +1,134 @@
+SHELL=/bin/bash
+
+# Provided by including Makefile
+#VERSION = 
+#LTGE_VAL = 
+
+CGDB = /raid1/projects/CGDB
+THIS_DIR = ${CGDB}/pORFs/${VERSION}
+SCRIPTS = ${CGDB}/scripts
+CG_FASTA = ${CGDB}/models/${VERSION}.fa
+CG_GTF = ${CGDB}/models/${VERSION}.gtf
+CG_BED = ${CGDB}/models/${VERSION}.bed
+CG_ABSORPTION = ${CGDB}/models/${VERSION}_absorption_info.txt
+CG_EXONS = ${CGDB}/models/${VERSION}_exons.bed
+CG_INTRONS = ${CGDB}/models/${VERSION}_introns.bed
+
+HPA = /raid1/databases/HPA
+HMPAS = /raid1/databases/HMPAS
+UNIPROT = /raid1/databases/UniProt
+
+# https://elifesciences.org/articles/13328v3#fig3       Fig 3B
+# http://www.mcponline.org/content/12/7/1780.full
+# https://academic.oup.com/nar/article/42/D1/D845/1048773/TISdb-a-database-for-alternative-translation  AUC, AUA, AUU, CUG, GUG, UUG, AUG, AAG and AGG
+#* http://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1005170         AUG, CUG, GUG, UUG, ACG, AUU, AUC, AUA, AGG, AAG
+START_CODONS = atg ctg gtg ttg acg att atc ata agg aag  # As cDNA. In vivo initiator amino acid is M
+#ALL_PORF_FILES = $(shell ls ${THIS_DIR}/CG-{atg,ctg,gtg,ttg,acg,xxx}-pORFs-??${LTGE_VAL}.fa.bz2)
+GE_PORF_FILES = $(shell ls CG-{atg,ctg,gtg,ttg,acg,xxx}-pORFs-ge${LTGE_VAL}.fa.bz2)
+
+# These files were downloaded from http://www.genenames.org/cgi-bin/genefamilies/. Type in "ribosomal" to the search box and
+# navigate the subcategories to the downloadable sets.
+RIBO_SRC_FILES = 45S_rRNA_products.tsv 5S_rRNA_products.tsv ribosomal_proteins_large.tsv  ribosomal_proteins_small.tsv \
+                 mito_ribosomal_proteins_large-and-small.tsv  mito_rRNA_products.tsv
+
+
+# annotated-PM-v-%_isoform_groups
+.PHONY: clear all_pORF_files PM-v-CGDB_blast_output
+.SECONDARY:
+
+
+clear:
+	rm blast_index/*
+	rm annotated-PM-v-ge50_isoform_groups/*
+
+all_pORF_files: ${CG_FASTA}
+	${SCRIPTS}/mRNAAllORFs.py ${LTGE_VAL} $<
+
+
+# % is LTGE_VAL (eg ge50)
+# Format:
+# GroupID IsoformIDs      GeneSymbol(s)   pORFs   ProteinSequence
+same-pORF_%_all_isoform_groups.tsv.bz2:
+	${SCRIPTS}/compileIsoformGroups <(bzcat $(GE_PORF_FILES) | awk '{ l=$$0; getline; printf "%s\t%s\n",$$0,substr(l,2) }') \
+		${CGDB}/models/${VERSION}_loci_names.tsv same-pORF_$*_all_isoform_groups.tsv
+	bzip2 same-pORF_$*_all_isoform_groups.tsv
+
+
+CGDB-blastdb: ${CG_FASTA}
+	-mkdir blast_index
+	makeblastdb -dbtype nucl -in ${CG_FASTA}  -out blast_index/${VERSION} -title ${VERSION}
+
+
+# Format:
+# UNIPROT_ID      AA_SEQ  PM_TM_SEGMENTS  HAS_GPI
+annotated_PM_proteins.tsv.gz: ${HPA}/cell_membrane_proteins.tsv.gz ${UNIPROT}/PM_transmembrane.tsv.gz ${UNIPROT}/PM_GPI.tsv.gz
+	${SCRIPTS}/compileMasterAnnotationSource.py $^ ${HMPAS}/HMPAS_Sequence.txt ${HMPAS}/HMPAS_ClassMember.txt ${HMPAS}/HMPAS_SequenceFeature.txt \
+	${HMPAS}/HMPAS_ProteinInfo.txt $@
+
+
+annotated_PM_proteins.uniprot: annotated_PM_proteins.tsv.gz
+	zcat $< | tail -n +2 | cut -f 1 > $@
+
+
+# Use annotated_PM_proteins.uniprot at UniProt to map uniprot to RefSeq and ENSEMBL transcripts, creating
+# uniprot_to_refseq.txt and creating uniprot_to_gencode.txt
+uniprot_w_no_db_xref.txt: uniprot_to_refseq.txt uniprot_to_gencode.txt
+	cat <(tail -n +2 uniprot_to_refseq.txt | cut -f 1) <(tail -n +2 uniprot_to_gencode.txt | cut -f 1) | sort | uniq > mapped_uniprot.txt
+	cat mapped_uniprot.txt annotated_PM_proteins.uniprot | sort | uniq -u >> $@
+	rm mapped_uniprot.txt
+
+
+PM-v-CGDB_blast_output: uniprot_w_no_db_xref.txt annotated_PM_proteins.tsv.gz
+	join uniprot_w_no_db_xref.txt <(zcat annotated_PM_proteins.tsv.gz | tail -n +2 | sort -k1,1) | awk '{printf ">%s\n%s\n",$$1,$$2}' > uniprot_w_no_db_xref.fa
+	-mkdir $@
+	${SCRIPTS}/sequenceSimilaritySearch.py 9 uniprot_w_no_db_xref.fa blast_index/${VERSION} $@
+	rm uniprot_w_no_db_xref.fa
+
+
+# Compile all CGDB isoforms that are "linked" by common exon or splice junction to another UniProt PM-annotated CGDB isoform.
+# Format:
+# CGDB_ISOFORM    TM_PROTEIN_ID   GPI_PROTEIN_ID
+CGDB_to_PM_UniProt_annotation_%.tsv.gz: uniprot_to_refseq.txt uniprot_to_gencode.txt ${CG_ABSORPTION} same-pORF_%_all_isoform_groups.tsv.bz2 annotated_PM_proteins.tsv.gz ${CG_EXONS}
+	${SCRIPTS}/matchUniprotToCGDB.py $^ PM-v-CGDB_blast_output $@
+
+# From the CGDB PM isoforms, form groups of them that encode the same same ORFs, thereby creating isoform groups of isoforms with same coding potential.
+# Format:
+# IsoformIDs 	UniProtIDs	GeneSymbols	IsoformGroups
+PM_isoform_groups_%.tsv.bz2: same-pORF_%_all_isoform_groups.tsv.bz2 CGDB_to_PM_UniProt_annotation_%.tsv.gz
+	${SCRIPTS}/createIsoformGroupsOfType.py PM_and_GPI $^ $@
+
+
+##### Identify PM isoform groups based on more detailed sequence-level information/topology
+
+# TODO: create a 2nd file that contains pORFs that match PM proteins but do not align to their TM segments.
+# In this way, won't miss incomplete mRNA transcripts.
+#pORF_%_PM_annotations.tsv.gz: annotated_PM_proteins.tsv.gz
+#	${SCRIPTS}/annotatepORFs.py $< annotated-PM-v-$*_isoform_groups $@
+
+
+# Needed?
+#CG-longest-pORFs-%.fa.bz2: $(addsuffix -pORFs-%.fa.bz2, $(addprefix CG-, $(START_CODONS)))
+#	bzcat $^ | ${SCRIPTS}/selectLongestORFForEachStopCodon.py $@
+
+
+##### Identify all ribosome related transcripts
+
+ribosomal_HGNC_IDs.txt:
+	cat $(RIBO_SRC_FILES)  | cut -f 1 | egrep -v "^HGNC|^ " | sort -n | uniq | awk '{print ("HGNC:" $$0)}' > $@
+
+
+# The file "Biomart_exons_raw.tsv" was created manually by using ribosomal_HGNC_IDs.txt as the gene filter input at Ensembl Biomart.
+ribosome_related_exons.bed: Biomart_exons_raw.tsv
+	tail -n +2 $< | sort -k5,5nr -k4,4 -k3,3n -k2,2 | uniq -f 1 | awk '($$4 !~ "PATCHED" && $$5 == 1){printf "chr%s\t%s\t%s\tNA\t0\t+\n",$$4,$$3,$$2}' > $@
+	tail -n +2 $< | sort -k5,5nr -k4,4 -k3,3n -k2,2 | uniq -f 1 | awk '($$4 !~ "PATCHED" && $$5 == -1){printf "chr%s\t%s\t%s\tNA\t0\t-\n",$$4,$$3,$$2}' >> $@
+
+
+CGDB_ribosomal_transcripts.txt: ribosome_related_exons.bed
+	intersectBed -u -s -F 1.0 -a ${CG_BED} -b $< | cut -f 4 | sort | uniq > $@
+
+
+CGDB_ribosomal_loci.txt: ribosome_related_exons.bed
+	intersectBed -u -s -F 1.0 -a ${CG_BED} -b $< | cut -f 4 | cut -f 1 -d. | sort | uniq > $@
+
+representative_rRNA_transcripts.txt:
+	@echo "Made from manual compilation of just one representative of each rRNA species in the genome and mitochondrion, since all are identical"

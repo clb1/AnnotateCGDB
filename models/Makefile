@@ -1,0 +1,79 @@
+SHELL = /bin/bash
+
+CGDB_ROOT = /raid1/projects/CGDB
+THIS_DIR = ${CGDB_ROOT}/models
+DB_MERGING_DIR = ${THIS_DIR}/database_merging
+SCRIPTS = ${CGDB_ROOT}/scripts
+
+GENOME_REF_DIR = /raid1/references_and_indexes/hg38
+GENOME_REF = ${GENOME_REF_DIR}/hg38.fa
+MFEPRIMER = /usr/local/src/MFEprimer
+
+.PHONY: install_CGDB
+
+.ONESHELL:
+
+install_CGDBv%: 
+	ln -s ${DB_MERGING_DIR}/v$*/CGDBv$*.bed
+	ln -s ${DB_MERGING_DIR}/v$*/CGDBv$*.gtf
+	ln -s ${DB_MERGING_DIR}/v$*/CGDBv$*.gff3
+	ln -s ${DB_MERGING_DIR}/v$*/CGDBv$*_absorption_info.txt
+	${MAKE} CGDBv$*.fa
+	${MAKE} CGDBv$*_loci_names.tsv
+	${MAKE} CGDBv$*_introns.bed
+	${MAKE} CGDBv$*_exons.bed
+
+
+CGDBv%.fa: CGDBv%.bed
+	fastaFromBed -fi ${GENOME_REF_DIR}/hg38.fa -bed $< -tab -s -split -name -fo stdout | awk '{printf ">%s\n%s\n", $$1, $$2}' > $@
+
+
+CGDBv%_loci_names.tsv: CGDBv%.gtf
+	echo -e "IsoformID\tGeneSymbol" > $@
+	awk '($$3=="exon")' $< | cut -f 9 | uniq | tr -d "\";" | awk '{OFS="\t"}{print $$4,$$2}' | egrep "^CG_" >> $@
+
+
+CGDBv%_introns.bed: CGDBv%.bed
+	${SCRIPTS}/makeIsoformIntronsBed.py $< $@
+
+
+CGDBv%_exons.bed: CGDBv%.bed
+	bedtools bed12tobed6 -i $< > $@
+
+
+CGDBv%_w_introns.fa: CGDBv%.bed
+	mergeBed -s -i <(sort -k 1,1 -k2,2n $<) -c 4 -o distinct > merged-$<
+	fastaFromBed -s -name -fi ${GENOME_REF} -bed <(awk '{OFS="\t"}{print $$1,$$2,$$3,$$5,0,$$4}' merged-$<) -fo $@-w-lower
+	cat $@-w-lower | tr a-z A-Z > $@
+	rm $@-w-lower
+
+CGDBv%-isoforms-parts.bed: CGDBv%.gtf
+	${SCRIPTS}/makeIsoformExonsAndSpliceJunctionsBed.py $< tmp-CG-isoforms-parts.bed
+	sort -k1,1 -k2,2n tmp-CG-isoforms-parts.bed > $@
+	rm tmp-CG-isoforms-parts.bed
+
+
+CGDBv%-isoforms-intronic-parts.bed: CGDBv%.gtf
+	${SCRIPTS}/makeIsoformIntronsBed.py $< $@
+
+
+CGDBv%-isoforms-exonic-parts.bed: CGDBv%-isoforms-parts.bed
+	coverageBed -s -a <(awk '{if ($$10==1) print}' $<) -b <(awk '{if ($$10==1) print}' $<) -d | cut -f 1-4,13,14 | ${SCRIPTS}/extractUniqueAndSharedExonicRegions.py | \
+	sort -k1,1 -k2,2n > $@
+
+
+CG-isoforms-junction-parts.bed: CG-isoforms-parts.bed
+	awk '{if ($$10==2) print}' $< | sort -k1,1 -k2,2 -k3,3 -S 30G | groupBy -g 1,2,3 -c 5 -o sum -full | sort -k1,1 -k2,2n | awk '{OFS="\t"; if ($$13>1) {$$4="CG"}; print}' > $@
+
+
+CGDBv%-isoforms-shared-signatures.txt: CGDBv%.fa CGDBv%.gtf CGDBv%-isoforms-parts.bed CGDBv%-isoforms-exonic-parts.bed
+	${SCRIPTS}/groupIsoformsBySharedSignature $^ $@
+
+
+### MFE ###
+
+CGDBv%.fa.uni CGDBv%.fa.2bit CGDBv%.fa.sqlite3.db: CGDBv%.fa
+	${MFEPRIMER}/IndexDb.sh $< 9
+
+CGDBv%.fa-k8.1bp-mm.pkl: CGDBv%.fa.sqlite3.db # -k8
+	${SCRIPTS}/connectMismatchKmers.py 1 8 $< $@
